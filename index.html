@@ -1,0 +1,883 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <title>ConvNetJS CIFAR-10 demo</title>
+    <style>
+        .layer {
+            border: 1px solid #999;
+            margin-bottom: 5px;
+            text-align: left;
+            padding: 10px;
+        }
+        .layer_act {
+        width: 500px;
+        float: right;
+        }
+        .ltconv {
+        background-color: #FDD;
+        }
+        .ltrelu {
+        background-color: #FDF;
+        }
+        .ltpool {
+        background-color: #DDF;
+        }
+        .ltsoftmax {
+        background-color: #FFD;
+        }
+        .ltfc {
+        background-color: #DFF;
+        }
+        .ltlrn {
+        background-color: #DFD; 
+        }
+        .ltitle {
+        color: #333;
+        font-size: 18px;
+        }
+        .actmap {
+        margin: 1px;
+        }
+        #trainstats {
+        text-align: left;
+        }
+        .clear {
+        clear: both;
+        }
+        #wrap {
+        width: 800px;
+        margin-left: auto;
+        margin-right: auto;
+        }
+        h1 {
+        font-size: 16px;
+        color: #333;
+        background-color: #DDD;
+        border-bottom: 1px #999 solid;
+        text-align: center;
+        }
+        .secpart {
+        width: 400px;
+        float: left;
+        }
+        #lossgraph {
+        /*border: 1px solid #F0F;*/
+        width: 100%;
+        }
+        .probsdiv canvas {
+        float: left;
+        }
+        .probsdiv {
+        height: 60px;
+        width: 180px;
+        display: inline-block;
+        font-size: 12px;
+        box-shadow: 0px 0px 2px 2px #EEE;
+        margin: 5px;
+        padding: 5px;
+        color: black;
+        }
+        .pp {
+        margin: 1px;
+        padding: 1px;
+        }
+        #testset_vis {
+        margin-bottom: 200px;
+        }
+        body {
+        font-family: Arial, "Helvetica Neue", Helvetica, sans-serif;
+        }
+    </style>
+
+    <script src="./build/jquery-1.8.3.min.js"></script>
+    <script src="./build/vis.js"></script>
+    <script src="./build/util.js"></script>
+    <script src="./build/convnet.js"></script>
+
+    <script src="./cifar10/cifar10_labels.js"></script>
+
+    <script>
+        var layer_defs, net, trainer;
+        var defaultNetConfig = "layer_defs = [];\n\
+            layer_defs.push({type:'input', out_sx:32, out_sy:32, out_depth:3});\n\
+            layer_defs.push({type:'conv', sx:5, filters:16, stride:1, pad:2, activation:'relu'});\n\
+            layer_defs.push({type:'pool', sx:2, stride:2});\n\
+            layer_defs.push({type:'conv', sx:5, filters:20, stride:1, pad:2, activation:'relu'});\n\
+            layer_defs.push({type:'pool', sx:2, stride:2});\n\
+            layer_defs.push({type:'conv', sx:5, filters:20, stride:1, pad:2, activation:'relu'});\n\
+            layer_defs.push({type:'pool', sx:2, stride:2});\n\
+            layer_defs.push({type:'softmax', num_classes:10});\n\
+            \n\
+            net = new convnetjs.Net();\n\
+            net.makeLayers(layer_defs);\n\
+            \n\
+            trainer = new convnetjs.SGDTrainer(net, {method:'adadelta', batch_size:4, l2_decay:0.0001});\n\
+            ";
+        // vis.js里的类实例化, 折线图
+        var lossGraph = new cnnvis.Graph();
+        // util.js中的window实例化
+        var xLossWindow = new cnnutil.Window(100);
+        var wLossWindow = new cnnutil.Window(100);
+        var trainAccWindow = new cnnutil.Window(100);
+        var valAccWindow = new cnnutil.Window(100);
+        var testAccWindow = new cnnutil.Window(50, 1);
+        var step_num = 0;
+        
+        // util中的工具方法
+        var maxmin = cnnutil.maxmin;
+        var f2t = cnnutil.f2t;
+
+        // cifar10_labels.js中的标签就是对应这里的；
+        var classes_txt = ['airplane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck'];
+        // 使用验证数据
+        var use_validation_data = true;
+        // 20个训练 批次 , 1个测试批次
+        var num_batches = 51; 
+        var test_batch = 50;
+        var data_img_elts = new Array(num_batches);
+        var img_data = new Array(num_batches);
+        var loaded = new Array(num_batches);
+        var loaded_train_batches = [];
+
+        // int main
+        // 主方法，入口，最新的JQ报错，之后再调试
+        $(window).load(function () {
+            // 赋值给，实例化网络和trainer的输入框
+            $("#newnet").val(defaultNetConfig);
+            // 执行里面的代码
+            eval($("#newnet").val());
+            // 把网络内部的4个参数显示到页面上，可以让用户修改
+            update_net_param_display();
+            // 设置默认值false，都没有加载
+            for (var k = 0; k < loaded.length; k++) { loaded[k] = false; }
+            // async load train set batch 0 (6 total train batches)
+            // 加载训练数据 批次0和批次50，训练；一共有6批次？
+            // 先后加载两个图片，读取img数据到loaded_train_batches数组中
+            // cifar10_batch_0.png cifar10_batch_50.png 
+            load_data_batch(0); 
+            load_data_batch(test_batch); // async load test set (batch 6)
+            start_fun();
+        });
+
+        // main方法被调用,按批次加载训练数据
+        var load_data_batch = function (batch_num) {
+            // Load the dataset with JS in background
+            data_img_elts[batch_num] = new Image();
+            var data_img_elt = data_img_elts[batch_num];
+            data_img_elt.onload = function () {
+                var data_canvas = document.createElement('canvas');
+                // 两个图片的宽高都是1024X1000
+                data_canvas.width = data_img_elt.width;
+                data_canvas.height = data_img_elt.height;
+                var data_ctx = data_canvas.getContext("2d");
+                data_ctx.drawImage(data_img_elt, 0, 0); // copy it over... bit wasteful :(
+                img_data[batch_num] = data_ctx.getImageData(0, 0, data_canvas.width, data_canvas.height);
+                // 这个批次标识为true已加载
+                loaded[batch_num] = true;
+                // test_batch为50，所以两次只有第一次0push到了loaded_train_batches数组中；
+                if (batch_num < test_batch) { loaded_train_batches.push(batch_num); }
+                console.log('finished loading data batch ' + batch_num);
+            };
+            data_img_elt.src = "cifar10/cifar10_batch_" + batch_num + ".png";
+        }
+        // main方法中被调用；这里调用load_and_step，持续 训练每一个新图片
+        var start_fun = function () {
+            // 0和50两个批次加载好了，开始定时执行load_and_step
+            if (loaded[0] && loaded[test_batch]) {
+                console.log('starting!');
+                setInterval(load_and_step, 0); // lets go!
+            }
+            else { setTimeout(start_fun, 200); } // keep checking
+        }
+
+        // loads a training image and trains on it with the network
+        // 加载一个训练图像并与网络一起训练
+        var paused = false;
+        var load_and_step = function () {
+            // 如果点击暂停就会停止
+            if (paused) return;
+            var sample = sample_training_instance();
+            step(sample); // process this image
+            //setTimeout(load_and_step, 0); // schedule the next iteration
+        }
+
+        // 上个方法load_and_step中调用；把img数据和label组成对象返回
+        var sample_training_instance = function () {
+            // find an unloaded batch 找到unloaded批次
+            // loaded_train_batches 已经load的批次编号的数组，这里只有一个0，长度1
+            // [0,1)向下取整只能是0
+            var bi = Math.floor(Math.random() * loaded_train_batches.length);
+            // b就是0，第0批次
+            var b = loaded_train_batches[bi];
+            // k是[0,1000) 一个大图是一个批次，有1000行数据，每一行是一个图片
+            var k = Math.floor(Math.random() * 1000); 
+            // 先写死取第一行
+            // var k = 0; 
+            // b是0所以 n = k; n是60万数据中的第几行，k是这一批1000个中的第几行
+            var n = b * 1000 + k;
+            // load more batches over time
+            // 随着时间的推移，加载更多批次; 训练2000次再加载一张图片
+            if (step_num % 2000 === 0 && step_num > 0) {
+                for (var i = 0; i < num_batches; i++) {
+                    if (!loaded[i]) {
+                        // load it
+                        load_data_batch(i);
+                        break; // okay for now
+                    }
+                }
+            }
+            // fetch the appropriate row of the training image and reshape into a Vol
+            // 获取训练图像的适当行，并重新塑造成卷
+            // 第0批次图片的全部数据
+            var p = img_data[b].data;
+            // 初始化一个Vol，sx=xy=32,depth=3,dw和w初始值都是0
+            var x = new convnetjs.Vol(32, 32, 3, 0.0);
+            // w = 1024
+            var W = 32 * 32;
+            var j = 0;
+            // 三层循环，3，32，32
+            for (var dc = 0; dc < 3; dc++) {
+                var i = 0;
+                for (var xc = 0; xc < 32; xc++) {
+                    for (var yc = 0; yc < 32; yc++) {
+                        // w=1024,k是0-1000随机数
+                        // 第一行k=0，
+                        // 第一次ix=0;第二次ix=4;第三次ix=8;第四次ix=12
+                        var ix = ((W * k) + i) * 4 + dc;
+                        // set方法在convnet.js的168行，设置w值
+                        // 前3个参数计算索引，把源数据/255-0.5处理后赋值到w对应位置
+                        // p中是RGBA，w只存RGB
+                        // set(0,0,0,p[0]/255-0.5)  w[0]赋值
+                        // set(1,0,0,p[4]/255-0.5)  w[3]赋值
+                        // set(2,0,0,p[8]/255-0.5)  w[6]赋值
+                        // set(3,0,0,p[12]/255-0.5)  w[9]赋值
+                        // ...
+                        // set(31,0,0,p[124]/255-0.5)  w[93]赋值
+                        // 最内层第一轮，就是把一个图片32个像素点的R值计算存到w中
+                        // set(0,1,0,p[128]/255-0.5)  w[96]赋值
+                        // set(1,1,0,p[132]/255-0.5)  w[99]赋值
+                        // ...第二轮继续
+                        // 里面两层32X32=1024，把第一个图片的1024个像素点的R值都填到w中
+                        // 最外层3个，依次继续弄像素点的G和B
+                        // k换不同的行,只是P的索引变了，其他都是一样，也是填到w[0]w[3]w[6]...
+                        x.set(yc, xc, dc, p[ix] / 255.0 - 0.5);
+                        i++;
+                    }
+                }
+            }
+            // 增强训练，创建位置偏移或翻转的副本
+            // dx和dy都是-2到3;表示位移的偏移量；
+            // 又因为是随机的，可能同一张图片选中多次，然后用不同偏移量进行多次训练
+            var dx = Math.floor(Math.random() * 5 - 2);
+            var dy = Math.floor(Math.random() * 5 - 2);
+            // augment在convnet.js的236行
+            // x是Vol，32是输出大小，最后一个参数是随机的true或false表示左右翻转
+            // 得到一个偏移量训练、反转训练的Vol
+            x = convnetjs.augment(x, 32, dx, dy, Math.random() < 0.5); 
+            //maybe flip horizontally; 可能会水平翻转
+            // use_validation_data使用验证数据，n=0第一行肯定是验证的，所以需要随意换行才行
+            var isval = use_validation_data && n % 10 === 0 ? true : false;
+            // k是这一批1000个中的第几行,n是60万数据中的第几行,所以对应着labels数组
+            return { x: x, label: labels[n], isval: isval };
+        }
+
+        // 上个方法load_and_step中调用;
+        // 得到训练的状态参数，并进行验证得到准确性参数
+        var step = function (sample) {
+            // x就是类似img_to_vol的vol数据，y是图像真实的label
+            var x = sample.x;
+            var y = sample.label;
+            // isval真的话，进行验证，否则进行训练
+            if (sample.isval) {
+                // 用x来预测，验证我们的正确率
+                net.forward(x);
+                var yhat = net.getPrediction();
+                var val_acc = yhat === y ? 1.0 : 0.0;
+                // 保存到 验证的准确性window中
+                valAccWindow.add(val_acc);
+                return; // get out 换下一行数据
+            }
+            // isval为false不验证，进行训练，stats很多训练参数
+            var stats = trainer.train(x, y);
+            // 成本损失，页面的“分类损失”
+            var lossx = stats.cost_loss;
+            // L2权值衰减 页面的“L2权值衰减”
+            var lossw = stats.l2_decay_loss;
+            // 持续跟踪统计数据，如平均训练错误和损失，保存起来方便之后计算平均值
+            // 训练情况下进行预测
+            var yhat = net.getPrediction();
+            var train_acc = yhat === y ? 1.0 : 0.0;
+            xLossWindow.add(lossx);
+            wLossWindow.add(lossw);
+            // 保存到 训练的准确性window中
+            trainAccWindow.add(train_acc);
+            // 把训练的状态参数 可视化
+            var train_elt = document.getElementById("trainstats");
+            train_elt.innerHTML = '';
+            var t = '当前图片训练的Forward time: ' + stats.fwd_time + 'ms';
+            train_elt.appendChild(document.createTextNode(t));
+            train_elt.appendChild(document.createElement('br'));
+            var t = '当前图片训练的Backprop time: ' + stats.bwd_time + 'ms';
+            train_elt.appendChild(document.createTextNode(t));
+            train_elt.appendChild(document.createElement('br'));
+            // f2t函数，util.js的方法，返回d位小数的字符串，默认5位小数
+            var t = '分类损失 Classification loss: ' + f2t(xLossWindow.get_average());
+            train_elt.appendChild(document.createTextNode(t));
+            train_elt.appendChild(document.createElement('br'));
+            var t = 'L2权值衰减 L2 Weight decay loss: ' + f2t(wLossWindow.get_average());
+            train_elt.appendChild(document.createTextNode(t));
+            train_elt.appendChild(document.createElement('br'));
+            var t = '训练的准确性: ' + f2t(trainAccWindow.get_average());
+            train_elt.appendChild(document.createTextNode(t));
+            train_elt.appendChild(document.createElement('br'));
+            var t = '验证的准确性: ' + f2t(valAccWindow.get_average());
+            train_elt.appendChild(document.createTextNode(t));
+            train_elt.appendChild(document.createElement('br'));
+            var t = '训练次数: ' + step_num;
+            train_elt.appendChild(document.createTextNode(t));
+            train_elt.appendChild(document.createElement('br'));
+            // 每训练100次，更新神经网络的各个图层；第0次时第一次显示；
+            if (step_num % 100 === 0) {
+                var vis_elt = document.getElementById("visnet");
+                // 传入net和绑定的dom元素
+                visualize_activations(net, vis_elt);
+            }
+            // 训练200次，把损失 绘制到折线图上
+            if (step_num % 200 === 0) {
+                // 成本损失 平均值
+                var xa = xLossWindow.get_average();
+                // L2权值衰减 平均值
+                var xw = wLossWindow.get_average();
+                // 第0次，xa和xw是-1，意味着还没有足够的数据用于估计，不绘制点
+                if (xa >= 0 && xw >= 0) {
+                    // 横轴训练次数；纵轴cost_loss平均值+l2_decay_loss平均值
+                    lossGraph.add(step_num, xa + xw);
+                    lossGraph.drawSelf(document.getElementById("lossgraph"));
+                }
+            }
+            // 在测试集上运行预测
+            if ((step_num % 100 === 0 && step_num > 0) || step_num === 100) {
+                test_predict();
+            }
+            step_num++;
+        }
+
+        // 在测试集中评估当前网络;
+        // 最下面显示各个图片的结果，append到testset_vis这个div中；
+        // 上个方法调用
+        var test_predict = function () {
+            // 拿到网络图层最后一层的out_depth作为结果的类别数目; 注意，这时的layers和最开始设置的不一样了，具体哪里修改了不懂了？
+            var num_classes = net.layers[net.layers.length - 1].out_depth;
+            document.getElementById('testset_acc').innerHTML = '';
+            // 总数量和测试正确的数量，初始化为0
+            var num_total = 0;
+            var num_correct = 0;
+            // 随机拿四个测试图像进行测试
+            for (num = 0; num < 4; num++) {
+                // 和上面的类似 sample_training_instance
+                // 区别是sample.x是6个Vol 偏移翻转的副本
+                var sample = sample_test_instance();
+                var y = sample.label;  // 正确的标签
+                // forward prop it through the network 通过网络向前支撑
+                // aavg是一个深度10的Vol，dw和d长度为10，内容都是0
+                var aavg = new convnetjs.Vol(1, 1, num_classes, 0.0);
+                // concat数组，确保我们总是有一个数组，不管上面返回的是单个Vol还是Vol数组
+                var xs = [].concat(sample.x);
+                // xs中Vol的数量，每一个Vol进行测试，6个Vol的w值相加给aavg
+                var n = xs.length;
+                for (var i = 0; i < n; i++) {
+                    // a本质也是一个Vol
+                    var a = net.forward(xs[i]);
+                    // addForm把传入Vol的w值加到原Vol的w中
+                    aavg.addFrom(a);
+                }
+                var preds = [];
+                // 按照索引和值，组成对象加到preds数组中
+                for (var k = 0; k < aavg.w.length; k++) { 
+                    preds.push({ k: k, p: aavg.w[k] }); 
+                }
+                // 按照p值从打到小排序，即预测的概率; 
+                preds.sort(function (a, b) { return a.p < b.p ? 1 : -1; });
+                // [0]第一个就是预测概率最大的，k就是索引，判断是否等于真实的labels - y
+                var correct = preds[0].k === y;
+                if (correct) num_correct++;
+                num_total++;
+                // 把图片画到canvas中
+                var div = document.createElement('div');
+                div.className = 'probsdiv';
+                // 把Vol转换成canvas,就是w中还原成像素点; 默认画第一个Vol 传[0];第三个参数是缩放比例
+                draw_activations_COLOR(div, xs[0], 2); 
+                // add predictions
+                var probsdiv = document.createElement('div');
+                var t = '';
+                // 把预测概率最高的三个显示出来，按照概率大小显示元素宽度，正确的颜色为绿色
+                for (var k = 0; k < 3; k++) {
+                    var col = preds[k].k === y ? 'rgb(85,187,85)' : 'rgb(187,85,85)';
+                    t += '<div class=\"pp\" style=\"width:' + Math.floor(preds[k].p / n * 100) + 'px; margin-left: 70px; background-color:' + col + ';\">' + classes_txt[preds[k].k] + '</div>'
+                }
+                probsdiv.innerHTML = t;
+                div.appendChild(probsdiv);
+                // 最后把div加到页面上，JQ的动效
+                $(div).prependTo($("#testset_vis")).hide().fadeIn('slow').slideDown('slow');
+                // 显示超过200个canvas，把最下面删掉, 显示最新的200个
+                if ($(".probsdiv").length > 200) {
+                    $("#testset_vis > .probsdiv").last().remove(); 
+                }
+            }
+            // 测试完了4个之后，加到testAccWindow中; testAccWindow是公共变量只增没有减少的；
+            testAccWindow.add(num_correct / num_total);
+            $("#testset_acc").text('当前的测试精度: ' + testAccWindow.get_average());
+        }
+
+        // 测试一个随机的图片，上个方法test_predict中调用
+        var sample_test_instance = function () {
+            // test_batch最开始设置的50，k和n的意思同上
+            var b = test_batch;
+            var k = Math.floor(Math.random() * 1000);
+            var n = b * 1000 + k;
+            // 根据批量次数拿到图片数据
+            var p = img_data[b].data;
+            // 初始化一个Vol，dw和w都是0
+            var x = new convnetjs.Vol(32, 32, 3, 0.0);
+            var W = 32 * 32;
+            var j = 0;
+            // 三层循环，修改x这个Vol的.w的值，逻辑同上
+            for (var dc = 0; dc < 3; dc++) {
+                var i = 0;
+                for (var xc = 0; xc < 32; xc++) {
+                    for (var yc = 0; yc < 32; yc++) {
+                        var ix = ((W * k) + i) * 4 + dc;
+                        x.set(yc, xc, dc, p[ix] / 255.0 - 0.5);
+                        i++;
+                    }
+                }
+            }
+            // 增强训练，创建位置偏移或翻转的副本
+            // 跟上面的区别，这里循环了6次，6个副本，3个不翻转，3个翻转
+            var xs = [];
+            for (var k = 0; k < 6; k++) {
+                var dx = Math.floor(Math.random() * 5 - 2);
+                var dy = Math.floor(Math.random() * 5 - 2);
+                xs.push(convnetjs.augment(x, 32, dx, dy, k > 2));
+            }
+            // 返回6个增强副本，之后进行计算平均值
+            return { x: xs, label: labels[n] };
+        }
+
+        
+        // 把Vol转换成canvas,就是w中还原成像素点; 
+        // A是Vol
+        // scale缩放比例,默认是2, 32X32显示到页面是64X64 
+        // grads是渐变dw值，默认false使用w
+        var draw_activations_COLOR = function (elt, A, scale, grads) {
+            var s = scale || 2; // scale
+            var draw_grads = false;
+            if (typeof (grads) !== 'undefined') draw_grads = grads;
+            // get max and min activation to scale the maps automatically
+            // 默认没传grads，取w值; dw保存的是渐变值,没有做任何处理都是0; 
+            var w = draw_grads ? A.dw : A.w;
+            // maxmin返回对象有5个值
+            var mm = maxmin(w);
+            var canv = document.createElement('canvas');
+            canv.className = 'actmap';
+            // 画布缩放
+            var W = A.sx * s;
+            var H = A.sy * s;
+            canv.width = W;
+            canv.height = H;
+            var ctx = canv.getContext('2d');
+            // 先创建一个空画布
+            var g = ctx.createImageData(W, H);
+            for (var d = 0; d < 3; d++) {
+                for (var x = 0; x < A.sx; x++) {
+                    for (var y = 0; y < A.sy; y++) {
+                        // 渐变，默认是false，走else
+                        if (draw_grads) {
+                            var dval = Math.floor((A.get_grad(x, y, d) - mm.minv) / mm.dv * 255);
+                        } else {
+                            // 之前像素转w值，p[ix] / 255.0 - 0.5 ; 
+                            // 现在先拿到w值，get方法计算A这个Vol的w索引并返回w值
+                            // w值减掉w中的最小值，除以最大差值，再乘以255。 为啥？
+                            var dval = Math.floor((A.get(x, y, d) - mm.minv) / mm.dv * 255);
+                        }
+                        // 缩放了，所有需要填充多出来的像素块
+                        // 比如默认扩大两倍，s=2，两层循环4个点填充原来一个点的像素值dval
+                        // alpha透明通道设置为255白色
+                        for (var dx = 0; dx < s; dx++) {
+                            for (var dy = 0; dy < s; dy++) {
+                                var pp = ((W * (y * s + dy)) + (dx + x * s)) * 4;
+                                g.data[pp + d] = dval;
+                                if (d === 0) g.data[pp + 3] = 255; // alpha channel
+                            }
+                        }
+                    }
+                }
+            }
+            // 再把g的像素点画进去
+            ctx.putImageData(g, 0, 0);
+            elt.appendChild(canv);
+        }
+        
+        // 神经网络各个图层可视化显示出来； 内部逻辑暂时先不看；
+        var visualize_activations = function (net, elt) {
+            // clear the element
+            elt.innerHTML = "";
+            // show activations in each layer
+            var N = net.layers.length;
+            for (var i = 0; i < N; i++) {
+                var L = net.layers[i];
+
+                var layer_div = document.createElement('div');
+
+                // visualize activations
+                var activations_div = document.createElement('div');
+                activations_div.appendChild(document.createTextNode('Activations:'));
+                activations_div.appendChild(document.createElement('br'));
+                activations_div.className = 'layer_act';
+                var scale = 2;
+                if (L.layer_type === 'softmax' || L.layer_type === 'fc') scale = 10; // for softmax
+                // HACK to draw in color in input layer
+                if (i === 0) {
+                    draw_activations_COLOR(activations_div, L.out_act, scale);
+                    draw_activations_COLOR(activations_div, L.out_act, scale, true);
+
+                    /*
+                    // visualize positive and negative components of the gradient separately
+                    var dd = L.out_act.clone();
+                    var ni = L.out_act.w.length;
+                    for(var q=0;q<ni;q++) { var dwq = L.out_act.dw[q]; dd.w[q] = dwq > 0 ? dwq : 0.0; }
+                    draw_activations_COLOR(activations_div, dd, scale);
+                    for(var q=0;q<ni;q++) { var dwq = L.out_act.dw[q]; dd.w[q] = dwq < 0 ? -dwq : 0.0; }
+                    draw_activations_COLOR(activations_div, dd, scale);
+                    */
+
+                    /*
+                    // visualize what the network would like the image to look like more
+                    var dd = L.out_act.clone();
+                    var ni = L.out_act.w.length;
+                    for(var q=0;q<ni;q++) { var dwq = L.out_act.dw[q]; dd.w[q] -= 20*dwq; }
+                    draw_activations_COLOR(activations_div, dd, scale);
+                    */
+
+                    /*
+                    // visualize gradient magnitude
+                    var dd = L.out_act.clone();
+                    var ni = L.out_act.w.length;
+                    for(var q=0;q<ni;q++) { var dwq = L.out_act.dw[q]; dd.w[q] = dwq*dwq; }
+                    draw_activations_COLOR(activations_div, dd, scale);
+                    */
+
+                } else {
+                    draw_activations(activations_div, L.out_act, scale);
+                }
+
+                // visualize data gradients
+                if (L.layer_type !== 'softmax' && L.layer_type !== 'input') {
+                    var grad_div = document.createElement('div');
+                    grad_div.appendChild(document.createTextNode('Activation Gradients:'));
+                    grad_div.appendChild(document.createElement('br'));
+                    grad_div.className = 'layer_grad';
+                    var scale = 2;
+                    if (L.layer_type === 'softmax' || L.layer_type === 'fc') scale = 10; // for softmax
+                    draw_activations(grad_div, L.out_act, scale, true);
+                    activations_div.appendChild(grad_div);
+                }
+
+                // visualize filters if they are of reasonable size
+                if (L.layer_type === 'conv') {
+                    var filters_div = document.createElement('div');
+                    if (L.filters[0].sx > 3) {
+                        // actual weights
+                        filters_div.appendChild(document.createTextNode('Weights:'));
+                        filters_div.appendChild(document.createElement('br'));
+                        for (var j = 0; j < L.filters.length; j++) {
+                            // HACK to draw in color for first layer conv filters
+                            if (i === 1) {
+                                draw_activations_COLOR(filters_div, L.filters[j], 2);
+                            } else {
+                                filters_div.appendChild(document.createTextNode('('));
+                                draw_activations(filters_div, L.filters[j], 2);
+                                filters_div.appendChild(document.createTextNode(')'));
+                            }
+                        }
+                        // gradients
+                        filters_div.appendChild(document.createElement('br'));
+                        filters_div.appendChild(document.createTextNode('Weight Gradients:'));
+                        filters_div.appendChild(document.createElement('br'));
+                        for (var j = 0; j < L.filters.length; j++) {
+                            if (i === 1) { draw_activations_COLOR(filters_div, L.filters[j], 2, true); }
+                            else {
+                                filters_div.appendChild(document.createTextNode('('));
+                                draw_activations(filters_div, L.filters[j], 2, true);
+                                filters_div.appendChild(document.createTextNode(')'));
+                            }
+                        }
+                    } else {
+                        filters_div.appendChild(document.createTextNode('Weights hidden, too small'));
+                    }
+                    activations_div.appendChild(filters_div);
+                }
+                layer_div.appendChild(activations_div);
+
+                // print some stats on left of the layer
+                layer_div.className = 'layer ' + 'lt' + L.layer_type;
+                var title_div = document.createElement('div');
+                title_div.className = 'ltitle'
+                var t = L.layer_type + ' (' + L.out_sx + 'x' + L.out_sy + 'x' + L.out_depth + ')';
+                title_div.appendChild(document.createTextNode(t));
+                layer_div.appendChild(title_div);
+
+                if (L.layer_type === 'conv') {
+                    var t = 'filter size ' + L.filters[0].sx + 'x' + L.filters[0].sy + 'x' + L.filters[0].depth + ', stride ' + L.stride;
+                    layer_div.appendChild(document.createTextNode(t));
+                    layer_div.appendChild(document.createElement('br'));
+                }
+                if (L.layer_type === 'pool') {
+                    var t = 'pooling size ' + L.sx + 'x' + L.sy + ', stride ' + L.stride;
+                    layer_div.appendChild(document.createTextNode(t));
+                    layer_div.appendChild(document.createElement('br'));
+                }
+
+                // find min, max activations and display them
+                var mma = maxmin(L.out_act.w);
+                var t = 'max activation: ' + f2t(mma.maxv) + ', min: ' + f2t(mma.minv);
+                layer_div.appendChild(document.createTextNode(t));
+                layer_div.appendChild(document.createElement('br'));
+
+                var mma = maxmin(L.out_act.dw);
+                var t = 'max gradient: ' + f2t(mma.maxv) + ', min: ' + f2t(mma.minv);
+                layer_div.appendChild(document.createTextNode(t));
+                layer_div.appendChild(document.createElement('br'));
+
+                // number of parameters
+                if (L.layer_type === 'conv' || L.layer_type === 'local') {
+                    var tot_params = L.sx * L.sy * L.in_depth * L.filters.length + L.filters.length;
+                    var t = 'parameters: ' + L.filters.length + 'x' + L.sx + 'x' + L.sy + 'x' + L.in_depth + '+' + L.filters.length + ' = ' + tot_params;
+                    layer_div.appendChild(document.createTextNode(t));
+                    layer_div.appendChild(document.createElement('br'));
+                }
+                if (L.layer_type === 'fc') {
+                    var tot_params = L.num_inputs * L.filters.length + L.filters.length;
+                    var t = 'parameters: ' + L.filters.length + 'x' + L.num_inputs + '+' + L.filters.length + ' = ' + tot_params;
+                    layer_div.appendChild(document.createTextNode(t));
+                    layer_div.appendChild(document.createElement('br'));
+                }
+
+                // css madness needed here...
+                var clear = document.createElement('div');
+                clear.className = 'clear';
+                layer_div.appendChild(clear);
+
+                elt.appendChild(layer_div);
+            }
+        }
+        // 上一个方法调用，细节之后再看；
+        var draw_activations = function (elt, A, scale, grads) {
+            var s = scale || 2; // scale
+            var draw_grads = false;
+            if (typeof (grads) !== 'undefined') draw_grads = grads;
+
+            // get max and min activation to scale the maps automatically
+            var w = draw_grads ? A.dw : A.w;
+            var mm = maxmin(w);
+
+            // create the canvas elements, draw and add to DOM
+            for (var d = 0; d < A.depth; d++) {
+
+                var canv = document.createElement('canvas');
+                canv.className = 'actmap';
+                var W = A.sx * s;
+                var H = A.sy * s;
+                canv.width = W;
+                canv.height = H;
+                var ctx = canv.getContext('2d');
+                var g = ctx.createImageData(W, H);
+
+                for (var x = 0; x < A.sx; x++) {
+                    for (var y = 0; y < A.sy; y++) {
+                        if (draw_grads) {
+                            var dval = Math.floor((A.get_grad(x, y, d) - mm.minv) / mm.dv * 255);
+                        } else {
+                            var dval = Math.floor((A.get(x, y, d) - mm.minv) / mm.dv * 255);
+                        }
+                        for (var dx = 0; dx < s; dx++) {
+                            for (var dy = 0; dy < s; dy++) {
+                                var pp = ((W * (y * s + dy)) + (dx + x * s)) * 4;
+                                for (var i = 0; i < 3; i++) { g.data[pp + i] = dval; } // rgb
+                                g.data[pp + 3] = 255; // alpha channel
+                            }
+                        }
+                    }
+                }
+                ctx.putImageData(g, 0, 0);
+                elt.appendChild(canv);
+            }
+        }
+        
+
+        // user settings 页面上用户自定义的参数设置
+        // 修改学习率 Learning rate
+        var change_lr = function () {
+            trainer.learning_rate = parseFloat(document.getElementById("lr_input").value);
+            update_net_param_display();
+        }
+        // 修改动量momentum
+        var change_momentum = function () {
+            trainer.momentum = parseFloat(document.getElementById("momentum_input").value);
+            update_net_param_display();
+        }
+        // 修改批量的大小
+        var change_batch_size = function () {
+            trainer.batch_size = parseFloat(document.getElementById("batch_size_input").value);
+            update_net_param_display();
+        }
+        // 修改衰减率
+        var change_decay = function () {
+            trainer.l2_decay = parseFloat(document.getElementById("decay_input").value);
+            update_net_param_display();
+        }
+        // 更新网络内部的参数，显示到页面上，可以让用户修改
+        var update_net_param_display = function () {
+            document.getElementById('lr_input').value = trainer.learning_rate;
+            document.getElementById('momentum_input').value = trainer.momentum;
+            document.getElementById('batch_size_input').value = trainer.batch_size;
+            document.getElementById('decay_input').value = trainer.l2_decay;
+        }
+        // 点击暂停
+        var toggle_pause = function () {
+            paused = !paused;
+            var btn = document.getElementById('buttontp');
+            if (paused) { btn.value = '继续' }
+            else { btn.value = '暂停'; }
+        }
+        // 把当前训练的net导出为json，然后可以直接给别的项目使用
+        // 字符串输出到textarea框中
+        var dump_json = function () {
+            document.getElementById("dumpjson").value = JSON.stringify(this.net.toJSON());
+        }
+        // 清空折线图
+        var clear_graph = function () {
+            lossGraph = new cnnvis.Graph(); // reinit graph too 
+        }
+        // 重置下各种数据
+        var reset_all = function () {
+            // reinit trainer
+            trainer = new convnetjs.SGDTrainer(net, { learning_rate: trainer.learning_rate, momentum: trainer.momentum, batch_size: trainer.batch_size, l2_decay: trainer.l2_decay });
+            update_net_param_display();
+            // 各种windows和图像的重置
+            xLossWindow.reset();
+            wLossWindow.reset();
+            trainAccWindow.reset();
+            valAccWindow.reset();
+            testAccWindow.reset();
+            lossGraph = new cnnvis.Graph(); // reinit graph too
+            step_num = 0;
+        }
+        // 从用户粘贴到textarea里的json加载网络
+        var load_from_json = function () {
+            var jsonString = document.getElementById("dumpjson").value;
+            var json = JSON.parse(jsonString);
+            net = new convnetjs.Net();
+            net.fromJSON(json);
+            reset_all();
+        }
+        // 加载系统提供的预训练数据，提高准确率
+        var load_pretrained = function () {
+            $.getJSON("cifar10_snapshot.json", function (json) {
+                net = new convnetjs.Net();
+                net.fromJSON(json);
+                trainer.learning_rate = 0.0001;
+                trainer.momentum = 0.9;
+                trainer.batch_size = 2;
+                trainer.l2_decay = 0.00001;
+                reset_all();
+            });
+        }
+        // 修改网络图层进行训练
+        var change_net = function () {
+            eval($("#newnet").val());
+            reset_all();
+        }
+
+    </script>
+
+</head>
+
+<body>
+    <div id="wrap">
+        <h2 style="text-align: center;"><a href="http://cs.stanford.edu/people/karpathy/convnetjs/">ConvNetJS</a>
+            CIFAR-10 demo</h2>
+        <h1>Description</h1>
+        <p>
+            这个演示在您的浏览器中训练CIFAR-10数据集上的卷积神经网络，只有Javascript。该数据集的最新技术水平约为90％，人类表现约为94％（不完美，因为数据集可能有点含糊不清）。我使用这个python脚本将原始文件（python版本）解析为可以使用img标签轻松加载到页面DOM中的批量图像。
+        </p>
+        <p>这个数据集更加困难，培训网络需要更长的时间。数据增强包括随机翻转和水平和逻辑上最多2px的随机图像移位。</p>
+        <p>
+            默认情况下，在本演示中，我们使用的是Adadelta，它是每个参数的自适应步长方法之一，因此我们不必担心随着时间的推移而改变学习率或动量。但是，如果您想使用SGD + Momentum培训师，我仍然会包含用于更改这些内容的文本字段。
+        </p>
+        <h1>训练参数统计</h1>
+        <div class="divsec" style="270px;">
+            <div class="secpart">
+                <input id="buttontp" type="submit" value="暂停" onclick="toggle_pause();" />
+                <div id="trainstats"></div>
+                <div id="controls">
+                    学习率: <input name="lri" type="text" maxlength="20" id="lr_input" />
+                    <input id="buttonlr" type="submit" value="修改" onclick="change_lr();" />
+                    <br />
+
+                    动量Momentum: <input name="momi" type="text" maxlength="20" id="momentum_input" />
+                    <input id="buttonmom" type="submit" value="修改" onclick="change_momentum();" />
+                    <br />
+
+                    批尺寸Batch size: <input name="bsi" type="text" maxlength="20" id="batch_size_input" />
+                    <input id="buttonbs" type="submit" value="修改" onclick="change_batch_size();" />
+                    <br />
+
+                    权值衰减 Weight decay: <input name="wdi" type="text" maxlength="20" id="decay_input" />
+                    <input id="buttonwd" type="submit" value="修改" onclick="change_decay();" />
+                </div>
+
+                <input id="buttondj" type="submit" value="把当前神经网络保存为JSON" onclick="dump_json();" /><br />
+                <input id="buttonlfj" type="submit" value="导入JSON初始化神经网络" onclick="load_from_json();" /><br />
+                <textarea id="dumpjson">把你的神经网络json数据 粘贴进来</textarea>
+                <br>
+
+                <input id="buttonpre" type="submit" value="加载系统提供的预训练网络(可以达到80%准确率)" onclick="load_pretrained();"
+                    style="height: 30px; width: 400px;" /><br />
+            </div>
+            <div class="secpart">
+                <div>
+                    Loss(cost_loss平均值 + l2_decay_loss平均值):<br />
+                    <canvas id="lossgraph">
+                    </canvas>
+                    <br />
+                    <input id="buttoncg" type="submit" value="清空折线图" onclick="clear_graph();" />
+                </div>
+            </div>
+            <div style="clear:both;"></div>
+        </div>
+
+        <h1>实例化一个 Network 和 Trainer</h1>
+        <div>
+            <textarea id="newnet" style="width:100%; height:200px;"></textarea><br />
+            <input id="buttonnn" type="submit" value="修改 神经网络的配置" onclick="change_net();" style="width:200px;height:30px;" />
+        </div>
+
+        <div class="divsec">
+            <h1>网络可视化</h1>
+            <div id="visnet"></div>
+        </div>
+
+        <div class="divsec">
+            <h1>测试集的预测示例</h1>
+            <div id="testset_acc"></div>
+            <div id="testset_vis"></div>
+        </div>
+
+    </div>
+</body>
+
+</html>
